@@ -1,22 +1,62 @@
-import { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, nativeImage } from 'electron';
+import { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, nativeImage, shell } from 'electron';
 import path from 'path';
 import clipboardWatcher from 'electron-clipboard-watcher';
 import Datastore from 'nedb';
+import autoLauncher from './autolauncher';
+import moment from 'moment';
+
+const iconPath = path.join(__dirname, 'icon.png');
 
 let mainWindow;
 let tray;
 let db;
+let preferences;
 let clipboardWatcherInstance;
-const iconPath = path.join(__dirname, 'icon.png');
+let cleanupInterval;
 
+const defaultUserPreferences = {
+  _id: '1',
+  autoStart: true,
+  expirySeconds: -1,
+};
 
 const winURL = process.env.NODE_ENV === 'development'
   ? `http://localhost:${require('../../../config').port}`
   : `file://${__dirname}/index.html`;
 
+/**
+ * Opens urls in external browser by default as the app is single window only.
+ * @param e  event
+ * @param url url
+ */
+const handleRedirect = (e, url) => {
+  if (url !== mainWindow.webContents.getURL()) {
+    e.preventDefault();
+    shell.openExternal(url);
+  }
+};
+
+const toggleAutoStart = (autoStart) => {
+  if (autoStart) {
+    autoLauncher.enable();
+  } else {
+    autoLauncher.disable();
+  }
+};
+
 const initDB = () => {
-  const dbPath = path.join(app.getPath('userData'), 'history.db');
+  const dbPath = path.join(app.getPath('userData'), 'history.json');
   db = new Datastore({ filename: dbPath, autoload: true });
+
+  const preferencesPath = path.join(app.getPath('userData'), 'preferences.json');
+  preferences = new Datastore({ filename: preferencesPath, autoload: true });
+  preferences.count({}, (err, count) => {
+    if (count === 0) {
+      preferences.insert(defaultUserPreferences, (err, res) => {
+        toggleAutoStart(res);
+      });
+    }
+  });
 };
 
 const sendNewHistoryToUI = () => {
@@ -32,7 +72,7 @@ const initClipboardWatcher = () => {
     onTextChange: (text) => {
       db.insert({
         text,
-        time: new Date(),
+        time: moment().toDate(),
       }, sendNewHistoryToUI);
     },
   });
@@ -66,13 +106,35 @@ const quit = () => {
   app.quit();
 };
 
+const configureCleanupTask = (expirySeconds) => {
+  expirySeconds = Number(expirySeconds);
+  const isEnabled = expirySeconds !== -1;
+  if (isEnabled) {
+    const cleanupTask = () => {
+      const now = moment();
+      const oldestPossibleEntryDate = now.subtract(expirySeconds, 'seconds');
+      db.remove({ time: { $lt: oldestPossibleEntryDate.toDate() } }, { multi: true }, () => {
+        sendNewHistoryToUI();
+      });
+    };
+    if (cleanupInterval) {
+      clearInterval(cleanupInterval);
+    }
+    cleanupInterval = setInterval(cleanupTask, 1000);
+  } else {
+    clearInterval(cleanupInterval);
+  }
+};
+
 const init = () => {
   mainWindow = new BrowserWindow({
     height: 550,
     width: 400,
     frame: false,
     resizable: false,
+    show: false,
     fullscreenable: false,
+    skipTaskbar: true,
     webPreferences: {
       backgroundThrottling: false,
     },
@@ -95,6 +157,9 @@ const init = () => {
   mainWindow.setPosition(pos.x, pos.y, false);
   initDB();
   initClipboardWatcher();
+
+  mainWindow.webContents.on('will-navigate', handleRedirect);
+  mainWindow.webContents.on('new-window', handleRedirect);
 };
 
 app.on('ready', init);
@@ -111,11 +176,26 @@ app.on('activate', () => {
   }
 });
 
-ipcMain.on('created', () => sendNewHistoryToUI());
+ipcMain.on('clipboard-history-created', () => sendNewHistoryToUI());
 
 const copyItemToClipboard = (item) => {
   clipboardWatcherInstance.stop();
   clipboard.writeText(item.text);
   initClipboardWatcher();
 };
+
 ipcMain.on('item-copied', (event, item) => copyItemToClipboard(item));
+
+ipcMain.on('preferences-changed', (event, prefs) => {
+  preferences.update({ _id: '1' }, prefs);
+  toggleAutoStart(prefs.autoStart);
+  configureCleanupTask(prefs.expirySeconds);
+});
+
+ipcMain.on('toolbar-created', () => {
+  preferences.findOne({ _id: '1' }, (err, doc) => {
+    mainWindow.webContents.send('preferences-changed', doc);
+  });
+});
+
+ipcMain.on('closed', toggleWindow);
