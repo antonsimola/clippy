@@ -1,6 +1,9 @@
 # clippy
 
-> clippy
+> Simple clipboard manager that tracks clipboard history using normal Ctrl-C / Copy actions.
+
+![demo video](https://i.imgur.com/rMb72yu.gif)
+
 
 ## Build Setup
 
